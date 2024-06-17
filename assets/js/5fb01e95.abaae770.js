@@ -1,1 +1,0 @@
-"use strict";(self.webpackChunkmongez_docs=self.webpackChunkmongez_docs||[]).push([[9502],{2122:t=>{t.exports=JSON.parse('{"title":"Getting Started","description":"A Robust Nodejs Framework","slug":"/category/getting-started","permalink":"/docs/category/getting-started","navigation":{"next":{"title":"Introduction","permalink":"/docs/warlock/getting-started/introduction"}}}')}}]);
