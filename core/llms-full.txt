@@ -8,7 +8,7 @@
 
 ---
 name: add-connector
-description: 'Extend Warlock''s lifecycle with a `BaseConnector` subclass — `name`, `priority`, `lifecyclePhase`, `start()`, `shutdown()`, `watchedFiles`. Register the instance via `connectorsManager.register(...)`; framework-level `warlock.config.ts > connectors` is planned but not shipped yet. Triggers: `BaseConnector`, `connectorsManager.register`, `ConnectorLifecyclePhase`, `ConnectorPriority`, `ConnectorName`; "add a queue worker", "wire a scheduler into bootstrap", "control startup ordering", "graceful shutdown hook"; typical import `import { BaseConnector, connectorsManager } from "@warlock.js/core"`. Skip: app context accessors — `@warlock.js/core/use-app-context/SKILL.md`; warlock.config.ts surface — `@warlock.js/core/configure-app/SKILL.md`; competing pattern: hand-rolled `process.on("SIGINT")` blocks, NestJS `OnModuleInit` lifecycle.'
+description: 'Extend Warlock with a `BaseConnector` subclass and register its instance in `warlock.config.ts > connectors`. Covers runtime lifecycle (`boot`, `start`, `shutdown`, priority, phase, watched files) and the optional static `build.generate` / `build.emit` contribution used by `warlock build`. Triggers: `BaseConnector`, `connectors`, `ConnectorLifecyclePhase`, `ConnectorBuildContribution`, `build.generate`, `build.emit`; "add a queue worker", "wire a subsystem into bootstrap", "contribute files to warlock build", "control startup ordering", "graceful shutdown hook". Skip: app context accessors — `@warlock.js/core/use-app-context/SKILL.md`; general config shape — `@warlock.js/core/configure-app/SKILL.md`; competing pattern: hand-rolled process signal blocks, NestJS lifecycle hooks.'
 ---
 
 # Warlock — add a connector
@@ -44,7 +44,7 @@ export class QueueConnector extends BaseConnector {
 }
 ```
 
-That's the connector class. The file's home is `src/connectors/<name>.ts` by convention — but **placing it there does not register it**. Custom connectors must be registered explicitly via `connectorsManager.register(...)` (see [Registering a connector](#registering-a-connector) below).
+That's the connector class. The file's home is `src/connectors/<name>.ts` by convention — but **placing it there does not register it**. Add an instance to `warlock.config.ts > connectors` (see [Registering a connector](#registering-a-connector) below).
 
 ## `BaseConnector` — required surface
 
@@ -100,37 +100,44 @@ If your connector is a self-contained service (queue client, scheduler), `Early`
 
 ## Registering a connector
 
-`connectorsManager.register(new YourConnector())` is the only path today. Nothing scans `src/connectors/` automatically — the folder is a convention for *where the file lives*, not a discovery mechanism. Place the registration call in your project's `src/app/main.ts` (auto-loaded once at boot, before the manager runs the early-phase startup):
+`warlock.config.ts > connectors` is the canonical source for both runtime boot and production-build contributions. Nothing scans `src/connectors/` automatically.
 
-```ts title="src/app/main.ts"
-import { connectorsManager } from "@warlock.js/core";
-import { QueueConnector } from "../connectors/queue-connector";
+```ts title="warlock.config.ts"
+import { defineConfig } from "@warlock.js/core";
+import { QueueConnector } from "./src/connectors/queue-connector";
 
-connectorsManager.register(new QueueConnector());
+export default defineConfig({
+  connectors: [new QueueConnector()],
+});
 ```
 
-`connectorsManager` is the singleton instance of `ConnectorsManager` exported from `@warlock.js/core`. `register(...connectors)` accepts one or many; it appends each to the list and re-sorts by priority.
+Order the array deliberately: runtime startup still follows connector priority, while build hooks are drained sequentially in array order. Names must be unique and must not claim a built-in connector name; Warlock rejects either mistake before boot or build work begins.
 
-Conditional registration is just an `if`:
+## Optional production-build contribution
 
-```ts title="src/app/main.ts"
-import { config, connectorsManager } from "@warlock.js/core";
-import { ExperimentalIndexerConnector } from "../connectors/experimental-indexer-connector";
+A connector may expose a static `build` object with `generate` and/or `emit`. Import `ConnectorBuildContribution` as a type and add the following property to the connector class. `warlock build` reads it from the configured instance without calling runtime `boot()` or `start()`.
 
-if (config.key("search.experimental.enabled")) {
-  connectorsManager.register(new ExperimentalIndexerConnector());
-}
+```ts title="inside your connector class"
+public readonly build: ConnectorBuildContribution = {
+  generate: async context => {
+    // Write generated server files beneath context.productionDir.
+    // Import optional build tooling inside this hook, not at module scope.
+    return {
+      entryImports: ['await import("./pages");'],
+      esbuild: { external: ["optional-server-peer"] },
+    };
+  },
+  emit: async context => {
+    // Emit non-esbuild artifacts after the server bundle is complete.
+  },
+};
 ```
 
-> **Heads up — planned change.** A framework-level `warlock.config.ts > connectors: [...]` field is planned so connectors register the same way `cli.commands` do today. Once shipped, the canonical pattern becomes:
->
-> ```ts title="warlock.config.ts (planned)"
-> export default defineConfig({
->   connectors: [new QueueConnector(), new SchedulerConnector()],
-> });
-> ```
->
-> Tracking: [`domains/core/plans/2026-05-23-connectors-in-warlock-config.md`](../../../../domains/core/plans/2026-05-23-connectors-in-warlock-config.md). Until that lands, use `connectorsManager.register(...)` in `main.ts`.
+- `generate(context)` runs before esbuild. It may write into `context.productionDir`, append generated-entry imports, and return a narrow esbuild patch (`jsx`, `jsxImportSource`, `define`, `external`, or `loader`). Generated files are dependency-checked again before bundling.
+- `emit(context)` runs after esbuild and before `.warlock/production` is removed; use it for artifacts esbuild does not produce, such as a client bundle or manifest.
+- Hooks are awaited sequentially in configured array order. A throw names the connector and fails the build.
+- The `build` object is closed to these two hooks. Construct plugins, pipelines, and aliases inside a hook via dynamic import so build-only dependencies do not enter the connector's runtime import graph.
+- Contributor esbuild patches merge before the user's `build` config; user values win. `define` and `loader` merge by key, while `external` concatenates and deduplicates.
 
 ## `watchedFiles` and dev restarts
 
@@ -227,7 +234,7 @@ See the [Registering a connector](#registering-a-connector) section above for th
 - **Set `this.active = true` only on success.** If `start()` throws partway, leaving `active` true means `shutdown()` thinks it has work to do and may double-close half-initialized resources.
 - **`shutdown()` must be idempotent.** SIGINT can fire twice on Windows. The manager guards re-entry with its own flag, but individual connectors get called once per shutdown loop — guard with `if (!this.active) return`.
 - **Don't reach across connector boundaries in `start()`.** The manager's `start()` loop runs all `boot()`s first, then all `start()`s — wiring across connectors goes through the `container` (`container.get("http.server")`), not through imports.
-- **Production build still needs registration.** Placing the connector under `src/connectors/<name>.ts` doesn't auto-register it in dev or prod. The connector exists wherever its `connectorsManager.register(...)` call runs — typically `src/app/main.ts`. The production bundle picks up that registration because `main.ts` is auto-loaded.
+- **Production build still needs config registration.** Placing the connector under `src/connectors/<name>.ts` does not auto-register it. Put the same instance in `warlock.config.ts > connectors`; that array is what build-time contribution discovery and runtime boot share.
 - **`watchedFiles` is restart-trigger, not dependency.** It says "I want to restart when this file changes." It does *not* mean the framework reloads that file first — that's the file orchestrator's job.
 
 ## See also
@@ -1215,7 +1222,7 @@ A controller is a thin function: pull inputs from `request`, call work, return t
 ```ts title="src/app/<module>/controllers/<action>.controller.ts"
 import { type RequestHandler } from "@warlock.js/core";
 
-export const listProductsController: RequestHandler = async (request, response) => {
+export const listProductsController: RequestHandler = async ({ request, response }) => {
   return response.success({ products: [] });
 };
 ```
@@ -1228,7 +1235,7 @@ That's the full contract. The `RequestHandler` annotation carries both parameter
 - File: `src/app/<module>/controllers/<action>.controller.ts`.
 - Export name matches the action in camelCase + `Controller` suffix: `listProductsController`, `createProductController`, `getProductController`.
 
-Scaffold with: `yarn warlock generate.controller <module>/<action>` (add `--with-validation` to get the schema generated alongside).
+Scaffold with: `pnpm warlock generate.controller <module>/<action>` (add `--with-validation` to get the schema generated alongside).
 
 ## Reading input
 
@@ -1270,10 +1277,10 @@ import { type Request, type RequestHandler } from "@warlock.js/core";
 import { type CreateProductSchema, createProductSchema } from "../schema/create-product.schema";
 import { createProductService } from "../services/create-product.service";
 
-export const createProductController: RequestHandler<Request<CreateProductSchema>> = async (
+export const createProductController: RequestHandler<Request<CreateProductSchema>> = async ({
   request,
   response,
-) => {
+}) => {
   const product = await createProductService(request.validated());
 
   return response.successCreate({ product });
@@ -1299,10 +1306,10 @@ Routes behind `authMiddleware` need `request.user` typed. Project conventions ad
 import { type GuardedRequestHandler } from "app/auth/requests/guarded.request";
 import { type CreateProductSchema, createProductSchema } from "../schema/create-product.schema";
 
-export const createProductController: GuardedRequestHandler<CreateProductSchema> = async (
+export const createProductController: GuardedRequestHandler<CreateProductSchema> = async ({
   request,
   response,
-) => {
+}) => {
   // request.user is typed
   const product = await createProductService(request.validated());
   return response.successCreate({ product });
@@ -1349,7 +1356,7 @@ If your controller is over ~30 lines, the work probably belongs in a service.
 import { type RequestHandler } from "@warlock.js/core";
 import { listProductsService } from "../services/list-products.service";
 
-export const listProductsController: RequestHandler = async (request, response) => {
+export const listProductsController: RequestHandler = async ({ request, response }) => {
   const { data: products, pagination } = await listProductsService({
     ...request.all(),
     organization_id: request.user.organizationId,
@@ -1366,10 +1373,10 @@ import { type Request, type RequestHandler } from "@warlock.js/core";
 import { type CreateProductSchema, createProductSchema } from "../schema/create-product.schema";
 import { createProductService } from "../services/create-product.service";
 
-export const createProductController: RequestHandler<Request<CreateProductSchema>> = async (
+export const createProductController: RequestHandler<Request<CreateProductSchema>> = async ({
   request,
   response,
-) => {
+}) => {
   const product = await createProductService(request.validated());
 
   return response.successCreate({ product });
@@ -1403,7 +1410,7 @@ export async function getProductService(id: string) {
 import type { RequestHandler } from "@warlock.js/core";
 import { getProductService } from "../services/get-product.service";
 
-export const getProductController: RequestHandler = async (request, response) => {
+export const getProductController: RequestHandler = async ({ request, response }) => {
   const product = await getProductService(request.input("id"));
 
   return response.success({ product });
@@ -1430,18 +1437,18 @@ No `if (!product)` branch in the controller. The error class carries the HTTP se
 
 ---
 name: create-module
-description: 'Scaffold a new feature module under `src/app/<name>/` via `warlock generate.module` and the follow-up generators for controllers, models, repositories, resources, and validation schemas. Triggers: `warlock generate.module`, `generate.controller`, `generate.service`, `generate.model`, `generate.repository`, `generate.resource`, `generate.migration`, `--minimal`, `gen.m`; "scaffold a new module", "create CRUD bootstrap", "add a controller to a module", "generate a model"; typical CLI `yarn warlock generate.module <name>`. Skip: framework-wide layout rules — `@warlock.js/core/warlock-conventions/SKILL.md`; routes file shape — `@warlock.js/core/register-route/SKILL.md`; controller shape — `@warlock.js/core/create-controller/SKILL.md`; competing tooling: `@nestjs/cli`, `hygen`, hand-rolled folder layouts.'
+description: 'Scaffold a new feature module under `src/app/<name>/` via `warlock generate.module` and the follow-up generators for controllers, models, repositories, resources, and validation schemas. Triggers: `warlock generate.module`, `generate.controller`, `generate.service`, `generate.model`, `generate.repository`, `generate.resource`, `generate.migration`, `--minimal`, `gen.m`; "scaffold a new module", "create CRUD bootstrap", "add a controller to a module", "generate a model"; typical CLI `pnpm warlock generate.module <name>`. Skip: framework-wide layout rules — `@warlock.js/core/warlock-conventions/SKILL.md`; routes file shape — `@warlock.js/core/register-route/SKILL.md`; controller shape — `@warlock.js/core/create-controller/SKILL.md`; competing tooling: `@nestjs/cli`, `hygen`, hand-rolled folder layouts.'
 ---
 
 # Warlock — create a module
 
-A module is a self-contained feature folder under `src/app/<name>/`. The CLI scaffolds the standard subfolders; the framework auto-loads `routes.ts`, `main.ts`, every `.ts(x)` file inside `events/`, and `utils/locales.ts`. You never `import` those files. (`src/app/main.ts` at the project root is also auto-loaded — that's the home for global one-time setup like `connectorsManager.register(...)`.)
+A module is a self-contained feature folder under `src/app/<name>/`. The CLI scaffolds the standard subfolders; the framework auto-loads `routes.ts`, `main.ts`, every `.ts(x)` file inside `events/`, and `utils/locales.ts`. You never `import` those files. (`src/app/main.ts` at the project root is also auto-loaded for global one-time application setup; connector instances belong in `warlock.config.ts > connectors`.)
 
 ## The shape
 
 ```bash
-yarn warlock generate.module products            # full CRUD bootstrap (default — controllers, model, services, repository, resource, schemas, routes, seed)
-yarn warlock generate.module products --minimal  # bare bones (routes.ts + main.ts + utils/locales.ts + empty subfolders)
+pnpm warlock generate.module products            # full CRUD bootstrap (default — controllers, model, services, repository, resource, schemas, routes, seed)
+pnpm warlock generate.module products --minimal  # bare bones (routes.ts + main.ts + utils/locales.ts + empty subfolders)
 ```
 
 Full CRUD is the default — opt down to a bare skeleton with `--minimal` (`-m`) when you want to build the module piece by piece. `--force` (`-f`) overwrites existing files. The plural form is auto-derived: `generate.module product` and `generate.module products` produce the same `src/app/products/` folder.
@@ -1547,9 +1554,9 @@ Inside the same module, plain relative imports (`./`, `../`).
 ### Full CRUD bootstrap
 
 ```bash
-yarn warlock generate.module products
+pnpm warlock generate.module products
 # edit schemas + model fields, then
-yarn warlock migrate
+pnpm warlock migrate
 ```
 
 The CRUD scaffold's `routes.ts` already chains the five controllers behind `guarded(...)`:
@@ -1577,11 +1584,11 @@ guarded(() => {
 ### Skeleton module, add pieces piecemeal
 
 ```bash
-yarn warlock generate.module orders --minimal
-yarn warlock generate.model orders/order --with-resource
-yarn warlock generate.repository orders/order
-yarn warlock generate.controller orders/place-order --with-validation
-yarn warlock generate.controller orders/list-orders
+pnpm warlock generate.module orders --minimal
+pnpm warlock generate.model orders/order --with-resource
+pnpm warlock generate.repository orders/order
+pnpm warlock generate.controller orders/place-order --with-validation
+pnpm warlock generate.controller orders/list-orders
 ```
 
 Then wire URLs by editing `src/app/orders/routes.ts` and the schema rules in `src/app/orders/schema/`.
@@ -1602,7 +1609,7 @@ await warmupProductCache();
 - **There's no standalone `generate.validation` command.** Validation is no longer scaffolded on its own — each controller carries its own schema (imported from `schema/` and bound via `controller.validation`). Generate the controller with `--with-validation` to get the paired schema file, or hand-write the `schema/*.schema.ts`.
 - **No `requests/` folder.** Controllers import the schema's exported type + value directly from `schema/*.schema.ts`; there is no `*.request.ts` alias.
 - **Subfolder is `seeds/` (plural), not `seed/`.** The seed file is `<module>.seed.ts`.
-- **`generate.module` does not run the migration.** It only creates the migration file. Run `yarn warlock migrate` separately to apply it.
+- **`generate.module` does not run the migration.** It only creates the migration file. Run `pnpm warlock migrate` separately to apply it.
 - **`models/<entity>/` is its own folder, not a flat file.** The generator puts `product.model.ts` inside `models/product/` so migrations can sit beside the model in `models/product/migrations/`.
 - **Don't import `routes.ts`, `main.ts`, or anything in `events/`.** They're auto-loaded; double-loading errors out at boot.
 - **`utils/locales.ts` is mandatory for translation keys.** Skip it and `t("products.notFound")` silently falls back to the key itself.
@@ -2285,7 +2292,7 @@ The "same error for missing user vs wrong password" pattern is deliberate — it
 `hashPassword` / `verifyPassword` need `bcryptjs`. Install it directly:
 
 ```bash
-yarn add bcryptjs
+pnpm add bcryptjs
 ```
 
 If you skip the install, the first call throws with the framework's install hint:
@@ -2294,14 +2301,14 @@ If you skip the install, the first call throws with the framework's install hint
 Password encryption requires the bcryptjs package.
 Install it with:
 
-  yarn add bcryptjs
+  pnpm add bcryptjs
 
 Or with your preferred package manager:
 
-  yarn add bcryptjs
+  pnpm add bcryptjs
 ```
 
-There is no `warlock add` feature for password hashing — `bcryptjs` is a plain dependency, so install it directly with `yarn add bcryptjs`.
+There is no `warlock add` feature for password hashing — `bcryptjs` is a plain dependency, so install it directly with `pnpm add bcryptjs`.
 
 ## Gotchas
 
@@ -2833,6 +2840,152 @@ router.get(["/health", "/healthz"], healthController);
 - [`warlock-conventions/SKILL.md`](../warlock-conventions/SKILL.md) — module layout, the `guarded` convention, path aliases.
 
 
+## request-memo  `@warlock.js/core/request-memo/SKILL.md`
+
+---
+name: request-memo
+description: 'Memoize async work for one HTTP request with `requestMemo<T>(key, fn)` — the v5 replacement for removed `fromRequest`, with single-flight promise sharing, settled-success reuse, rejection eviction, and no cross-request fallback. Triggers: `requestMemo`, `fromRequest`, `fromRequest removed`, `request-scoped cache`, `single-flight`, `current request memo`; "migrate off fromRequest", "load this once per request", "deduplicate concurrent loaders", "cache a repository lookup during one request"; typical import `import { requestMemo } from "@warlock.js/core"`. Skip: middleware-written request state — `@warlock.js/core/use-request-locals/SKILL.md`; process-wide or cross-request caching — `@warlock.js/core/use-middleware/SKILL.md`; competing patterns: dynamic `request[key]` properties, module-global `Map`, payload `request.get()` / `request.set()`.'
+---
+
+# Warlock — memoize work for one request
+
+`requestMemo()` is the v5 replacement for the removed `fromRequest()`. Use it when several code paths in the same HTTP request may need the same asynchronously computed value and the work should run once.
+
+## The exact signature
+
+From `core/src/http/context/request-memo.ts`:
+
+```ts
+export function requestMemo<T>(key: string, fn: () => Promise<T>): Promise<T>
+```
+
+Import it from the package root:
+
+```ts
+import { requestMemo } from "@warlock.js/core";
+```
+
+`fn` takes no arguments and must return a promise. Close over the current request or the inputs needed by the loader.
+
+## Migrate from v4 to v5
+
+### Before — v4 `fromRequest()`
+
+```ts title="src/app/tenants/utils/current-tenant.ts"
+import { fromRequest, type Request } from "@warlock.js/core";
+
+type Tenant = { id: string };
+
+async function loadTenant(id: string): Promise<Tenant> {
+  return { id };
+}
+
+export function currentTenant(request: Request): Promise<Tenant> {
+  const tenantId = String(request.header("x-tenant-id") ?? "");
+
+  return fromRequest("tenants.current", () => loadTenant(tenantId));
+}
+```
+
+### After — v5 `requestMemo()`
+
+```ts title="src/app/tenants/utils/current-tenant.ts"
+import { requestMemo, type Request } from "@warlock.js/core";
+
+type Tenant = { id: string };
+
+async function loadTenant(id: string): Promise<Tenant> {
+  return { id };
+}
+
+export function currentTenant(request: Request): Promise<Tenant> {
+  const tenantId = String(request.header("x-tenant-id") ?? "");
+
+  return requestMemo("tenants.current", () => loadTenant(tenantId));
+}
+```
+
+The call-site migration is usually the import and function name. The complete v5 example above also shows the callback-shape migration: if a v4 callback used the `Request` argument supplied by `fromRequest`, capture the surrounding `request` variable because `requestMemo`'s `fn` receives no arguments.
+
+## Single-flight behavior
+
+Within one request, the first call for a key invokes `fn` and stores its promise. Every concurrent caller using that key receives that exact promise, so parallel consumers do not duplicate the work. After the promise resolves, later calls during the same request keep receiving the cached successful promise.
+
+```ts title="src/app/catalog/controllers/show-product.controller.ts"
+import { requestMemo, type RequestHandler } from "@warlock.js/core";
+
+let loads = 0;
+
+async function loadProduct(): Promise<{ id: string }> {
+  loads += 1;
+  return { id: "product-1" };
+}
+
+export const showProductController: RequestHandler = async ({ response }) => {
+  const first = requestMemo("catalog.product", loadProduct);
+  const second = requestMemo("catalog.product", loadProduct);
+  const [product, sameProduct] = await Promise.all([first, second]);
+
+  return response.success({ product, sameProduct, loads });
+};
+```
+
+For that request, `first === second` and `loads` is `1`.
+
+A rejection is not cached. The rejected entry is deleted immediately, so a later call with the same key retries `fn`. Callers already sharing the rejected promise all observe that rejection.
+
+## Lifetime and isolation
+
+The memo table is attached indirectly to the current request-context store through a `WeakMap`. Each incoming request gets a fresh store, so:
+
+- two concurrent requests never share entries, even when they use the same key;
+- resolved values live only for the request's context lifetime;
+- the store and its memo entries are eligible for garbage collection after the request ends;
+- no value is written onto the `Request` object.
+
+Calling `requestMemo()` outside the HTTP request pipeline throws synchronously. It deliberately has no process-global fallback. For data meant to survive across requests, use an explicit application cache instead.
+
+## Why it replaces `fromRequest()`
+
+`fromRequest()` memoized through dynamic `request[key]` properties. That only type-checked because v4's `Request` had a `[key: string]: any` index signature. v5 removed both the unsafe index signature and `fromRequest()`; `requestMemo()` keeps the one-request lifetime without mutating `Request` or turning values into `any`.
+
+The new helper also provides real single-flight behavior: it stores the in-flight promise. The old helper awaited its callback before writing the result onto `Request`, so concurrent v4 callers could run the same callback more than once.
+
+## Key design
+
+Keys share one string namespace within a request. Use stable, namespaced keys and include every input that changes the result:
+
+```ts
+import { requestMemo } from "@warlock.js/core";
+
+type Product = { id: string };
+
+async function findProduct(id: string): Promise<Product> {
+  return { id };
+}
+
+export function productById(id: string): Promise<Product> {
+  return requestMemo(`catalog.product:${id}`, () => findProduct(id));
+}
+```
+
+Reusing one key for different result types is a caller bug: TypeScript cannot compare the generic type arguments used at separate call sites.
+
+## Gotchas
+
+- **Do not call it during bootstrap, in a CLI command, or from a background job.** There is no active HTTP request context there, so it throws.
+- **Do not omit result-changing inputs from the key.** `catalog.product` is wrong when different IDs may be loaded during one request; use `catalog.product:${id}`.
+- **Do not use `request.set()` as a replacement.** It writes to the request input payload read by `all()`, `input()`, and `validated()`.
+- **Failures retry.** If repeated failures must also be cached, this primitive is not that policy; catch and convert the failure into a successful result deliberately, or use another cache.
+- **Use `request.locals` for state written by middleware and read downstream.** Memoization and request attachment are separate jobs.
+
+## See also
+
+- [`use-request-locals/SKILL.md`](../use-request-locals/SKILL.md) — typed per-request data written by middleware.
+- [`write-middleware/SKILL.md`](../write-middleware/SKILL.md) — authoring and registering middleware.
+- [`create-controller/SKILL.md`](../create-controller/SKILL.md) — consuming request-scoped values from controllers.
+
+
 ## resolve-path  `@warlock.js/core/resolve-path/SKILL.md`
 
 ---
@@ -3124,7 +3277,7 @@ const result = await measure("publish-event", () =>
 
 ---
 name: run-app
-description: 'Three operational commands — `warlock dev` (HMR + type-gen + health checks), `warlock build` (esbuild bundle), `warlock start` (spawn the production bundle). All flags, all `warlock.config.ts` knobs that shape them. Triggers: `warlock dev`, `warlock build`, `warlock start`, `devServer`, `--fresh`, `--skip-typings`, `--skip-health`, `outdir`, `outFile`, `sourcemap`; "start the dev server", "build for production", "run the bundle", "skip type generation", "tune watch globs", "dev server keyboard shortcuts", "press r to restart", "press q to quit", "restart the dev server"; typical config `warlock.config.ts > devServer / build`. Skip: writing a custom CLI — `@warlock.js/core/write-cli-command/SKILL.md`; config shape — `@warlock.js/core/configure-app/SKILL.md`; competing tooling `nodemon`, `tsx`, `ts-node-dev`, `esbuild` direct.'
+description: 'Three operational commands — `warlock dev` (HMR + type-gen + health checks), `warlock build` (esbuild bundle), `warlock start` (spawn the production bundle). All flags, all `warlock.config.ts` knobs that shape them. Triggers: `warlock dev`, `warlock build`, `warlock start`, `devServer`, `--fresh`, `--skip-typings`, `--skip-health`, `outdir`, `outFile`, `sourcemap`, `PortInUseError`, `assertPortIsAvailable`, `EADDRINUSE`; "start the dev server", "build for production", "run the bundle", "skip type generation", "tune watch globs", "dev server keyboard shortcuts", "press r to restart", "press q to quit", "restart the dev server", "port already in use"; typical config `warlock.config.ts > devServer / build`. Skip: writing a custom CLI — `@warlock.js/core/write-cli-command/SKILL.md`; config shape — `@warlock.js/core/configure-app/SKILL.md`; competing tooling `nodemon`, `tsx`, `ts-node-dev`, `esbuild` direct.'
 ---
 
 # Warlock — run the app
@@ -3135,13 +3288,13 @@ Three commands move the app through its lifecycle: `dev` while you're editing, `
 
 ```bash
 # Local development
-yarn warlock dev
+pnpm warlock dev
 
 # Production build
-yarn warlock build
+pnpm warlock build
 
 # Run the built bundle
-yarn warlock start
+pnpm warlock start
 ```
 
 `dev` and `start` are **persistent** (long-running, no auto-exit). `build` is one-shot — it exits when the bundle is written.
@@ -3206,6 +3359,8 @@ A worker that dies **after running healthily for at least 5s** — OOM, a native
 ```
 
 A worker that dies *sooner* than that failed to **boot** — a broken config, a port already taken — and it has already printed why. Restarting there would just reprint the same error and bury it, so the supervisor mirrors the exit code and stops.
+
+A busy port is now caught *before* the bind attempt: the HTTP connector calls `assertPortIsAvailable(port, host)` immediately before `listen()`, so the failure is `Port <port> is already in use on <host>. Stop the dev server (or whatever else is listening on port <port>) and run again, or start on a free port…` — not a raw `EADDRINUSE` surfacing from inside Fastify. Same connector, same preflight, for `warlock start`.
 
 Flapping is capped: more than 3 crashes inside 60s and the supervisor gives up rather than restarting behind your back.
 
@@ -3311,6 +3466,23 @@ Defaults are sensible for the typical "Node service" deployment. Knobs to actual
 
 Just `warlockConfig: true`. Build doesn't need the app booted — it reads `warlock.config.ts`, runs esbuild, writes the file. Fast.
 
+### The build is all-or-nothing (5.2)
+
+`warlock build` never writes into `outdir` while it works. It builds into a hidden **sibling** temp directory — `.<outdir-basename>.build-<12 hex>`, e.g. `./.dist.build-9f1c2ab40de7` next to `./dist` — and only when every step has succeeded does it promote that directory into place with a rename. Same volume, so the promotion is atomic.
+
+Two consequences you can rely on:
+
+- **A successful build leaves no stale files.** Promotion replaces `outdir` wholesale (the old one is moved aside, the temp is renamed in, the old one is deleted). A file that an earlier build emitted and this one did not is gone — it is not merged over.
+- **A failed build leaves no usable `dist`.** The error path removes the temp directory and rethrows without ever touching `outdir`. A previous good `dist` is left exactly as it was; if there was none, none appears.
+
+The last thing written into the temp directory before promotion is `.warlock-build.json`, a two-field marker:
+
+```json
+{ "status": "success", "builtAt": "2026-09-01T12:34:56.789Z" }
+```
+
+It exists so `warlock start` can tell a promoted build from a directory that merely looks like one.
+
 ### Where the bundle lands
 
 ```
@@ -3320,16 +3492,28 @@ Just `warlockConfig: true`. Build doesn't need the app booted — it reads `warl
 
 `warlock start` uses the same `resolveBuildConfig()` helper to find the bundle, so the two commands stay in sync no matter how you override the config. If `build` and `start` disagree on where the bundle is, it's because `warlock.config.ts` is being read with different cwds — never the case in normal operation.
 
+If the app uses `@warlock.js/web` page routes, a successful `warlock build` also writes `page-routes.manifest.json` next to the bundle (same `outdir`) — the snapshot `warlock routes:diff` compares the live dev surface against. See [`warlock-routes/SKILL.md`](../warlock-routes/SKILL.md#warlock-routesdiff--catch-page-route-drift-before-it-ships).
+
 ## `warlock start` — run the production bundle
 
 Spawns `node <entryPath>` as a child process, forwarding signals (SIGINT / SIGTERM). `entryPath` is resolved from the same `build` config that produced the bundle.
 
+### It refuses a `dist` no successful build produced (5.2)
+
+Before spawning anything, `start` looks for the `.warlock-build.json` success marker in `outdir`. Missing, unreadable, malformed, or `status !== "success"` all collapse to one refusal on **stderr**, exit code `1`:
+
+```
+✖ "dist" was not produced by a successful `warlock build` run (no build-success marker found). Run `warlock build` before `warlock start`.
+```
+
+The three cases that reach it are: never built; a build that failed before promotion; and a directory assembled or edited by hand. They are deliberately not distinguished — the answer to all three is the same command. Note this replaces the old behaviour where `start` ran whatever happened to be sitting in `dist/`.
+
 ### Behavior
 
 ```bash
-yarn warlock start                        # → spawns node --enable-source-maps dist/app.js
-yarn warlock start --inspect              # → spawns node --enable-source-maps --inspect dist/app.js
-yarn warlock start --max-old-space-size=4096  # → spawns node --enable-source-maps --max-old-space-size=4096 dist/app.js
+pnpm warlock start                        # → spawns node --enable-source-maps dist/app.js
+pnpm warlock start --inspect              # → spawns node --enable-source-maps --inspect dist/app.js
+pnpm warlock start --max-old-space-size=4096  # → spawns node --enable-source-maps --max-old-space-size=4096 dist/app.js
 ```
 
 Everything you pass after `start` is forwarded to the spawned Node process. Use this to attach a debugger (`--inspect`), tune memory (`--max-old-space-size`), or pass any other Node flag without editing the command.
@@ -3381,8 +3565,36 @@ The started banner prints **only** when the running application reports a comple
 
 ```bash
 # a CI gate can be this blunt, and it is now correct
-yarn warlock start | grep -q "production server started"
+pnpm warlock start | grep -q "production server started"
 ```
+
+### Reading a failed start (5.2)
+
+The child is spawned with piped stdout/stderr and **every chunk is forwarded verbatim, live**, to the parent's matching stream. The application's own boot error is the thing you read — `warlock start` adds a summary underneath it, it does not replace it:
+
+```
+  ✖ warlock start failed — the server never finished booting
+  the application process exited with code 1
+  the cause is printed above, in the application's own output
+```
+
+The third line is conditional on the parent having actually seen child output. When the child produced none, it says so instead of pointing at something that isn't there:
+
+```
+  no output was captured from the application process — its cause did not reach this terminal
+```
+
+That distinction is the point of the change: an unhelpful "see above" printed above an empty terminal used to be the entire diagnostic.
+
+**Port already in use.** The HTTP connector preflights the port immediately before `listen()`, so a collision is named rather than surfacing as a raw `EADDRINUSE` from inside Fastify:
+
+```
+EADDRINUSE: Port 3000 is already in use on 127.0.0.1. Stop the dev server (or whatever
+else is listening on port 3000) and run again, or start on a free port — e.g.
+startHttpTestServer({ port: 3001 }).
+```
+
+The connector logs it fatally and exits `1`; the supervisor forwards that text and then prints the failure summary above it. `EACCES` on the port is treated the same way as `EADDRINUSE` (a privileged port you may not bind is also "not available"); anything else the probe throws is rethrown untouched.
 
 ### How readiness is reported
 
@@ -3428,7 +3640,7 @@ If you need conditional behavior, branch on `Application.environment` (the ortho
 }
 ```
 
-Now `yarn dev` / `yarn build` / `yarn start`. Standard Node hosting providers (Render, Fly, Railway, Heroku) recognize this layout.
+Now `pnpm dev` / `pnpm build` / `pnpm start`. Standard Node hosting providers (Render, Fly, Railway, Heroku) recognize this layout.
 
 ### Production Dockerfile
 
@@ -3436,9 +3648,9 @@ Now `yarn dev` / `yarn build` / `yarn start`. Standard Node hosting providers (R
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package.json yarn.lock ./
-RUN yarn install --frozen-lockfile
+RUN pnpm install --frozen-lockfile
 COPY . .
-RUN yarn warlock build
+RUN pnpm warlock build
 
 FROM node:20-alpine
 WORKDIR /app
@@ -3482,7 +3694,7 @@ That is deliberate: `build` and `start` do **not** force `production`. Forcing i
 ### Skip type-gen on machines without write access
 
 ```bash
-yarn warlock dev --skip-typings
+pnpm warlock dev --skip-typings
 ```
 
 Or persist it:
@@ -3500,21 +3712,22 @@ Useful in a containerized dev environment where `.warlock/typings.d.ts` is read-
 ### Memory-tune the production process
 
 ```bash
-yarn warlock start --max-old-space-size=4096
+pnpm warlock start --max-old-space-size=4096
 ```
 
 Or via `NODE_OPTIONS` in the deployment env if you don't want to change the start invocation:
 
 ```bash
-NODE_OPTIONS=--max-old-space-size=4096 yarn warlock start
+NODE_OPTIONS=--max-old-space-size=4096 pnpm warlock start
 ```
 
 ## Gotchas
 
 - **`warlock dev` is persistent — `Ctrl+C` to stop.** The framework's `persistent: true` flag keeps the process alive after `action` returns. Same for `start`.
 - **`--fresh` only deletes the manifest, not the transpile cache.** If you're chasing a stale-compile bug, `rm -rf .warlock/` clears everything. The manifest restoring is what `--fresh` solves.
-- **`warlock build` does NOT run migrations.** Production bundles ship the migration files but don't apply them. Run `yarn warlock migrate` against the production DB separately.
-- **`warlock start` requires a built bundle.** Run `warlock build` first, or you'll spawn `node` against a non-existent file and crash immediately.
+- **`warlock build` does NOT run migrations.** Production bundles ship the migration files but don't apply them. Run `pnpm warlock migrate` against the production DB separately.
+- **`warlock start` requires a build it can vouch for.** Since 5.2 it refuses any `outdir` without the `.warlock-build.json` success marker — a hand-assembled `dist/`, or one left behind by a build that failed, is rejected by that reason instead of being spawned and crashing halfway through boot. Run `warlock build` first.
+- **Do not add `.warlock-build.json` to `.gitignore`-driven artifact pruning.** Stripping it from a `dist/` you ship makes `warlock start` refuse the artifact on the target host. Copy `outdir` whole.
 - **`outdir` is the directory, `outFile` is the filename within it.** A common mistake is putting the full path in one and leaving the other default — you end up with `<full-path>/app.js` or `dist/<full-path>`. They concatenate.
 - **`sourcemap: false` cascades to `start`.** Stack traces lose `.ts` precision. Keep sourcemaps on unless artifact size is a hard constraint.
 - **`NODE_ENV` is not set by these commands.** The deployment env (your Dockerfile, CI, hosting provider) sets it. Forget it on a production server and `Application.isProduction` returns `false`, which flips cookie security, CORS, logging — silently. Always set `NODE_ENV=production` in production deployments.
@@ -3527,6 +3740,7 @@ NODE_OPTIONS=--max-old-space-size=4096 yarn warlock start
 - [`use-app-context/SKILL.md`](../use-app-context/SKILL.md) — `Application.environment` vs `Application.runtimeStrategy`.
 - [`add-connector/SKILL.md`](../add-connector/SKILL.md) — Early vs Late connector phases (why HTTP/socket boot late in dev).
 - [`update-packages/SKILL.md`](../update-packages/SKILL.md) — `warlock update` + the dev-server update notice (`devServer.checkForUpdates`).
+- [`warlock-routes/SKILL.md`](../warlock-routes/SKILL.md) — `warlock routes` / `warlock routes:diff`, the latter comparing live page routes against the manifest `warlock build` writes.
 
 
 ## send-mail  `@warlock.js/core/send-mail/SKILL.md`
@@ -3618,7 +3832,7 @@ const config: MailConfigurations = {
 };
 ```
 
-Requires `@aws-sdk/client-sesv2` installed (`yarn add @aws-sdk/client-sesv2`).
+Requires `@aws-sdk/client-sesv2` installed (`pnpm add @aws-sdk/client-sesv2`).
 
 ## Mail modes
 
@@ -3894,7 +4108,7 @@ await Mail.to(user.email)
 
 - **`.send()` validates** — `to`, `subject`, and at least one of `text`/`html`/`component` are required. Missing any throws synchronously.
 - **`@react-email/render` is optional.** Without it you get the basic fallback (inline styles, no MSO conditionals). Install it for production-quality HTML.
-- **`nodemailer` is loaded lazily** at import time. If you see `nodemailer is not installed` errors, run `warlock add mail` (or `yarn add nodemailer`).
+- **`nodemailer` is loaded lazily** at import time. If you see `nodemailer is not installed` errors, run `warlock add mail` (or `pnpm add nodemailer`).
 - **`secure: true` requires port 465.** For port 587 use `secure: false` and `tls: true` (STARTTLS).
 - **Test mode is process-global.** Set it in `beforeAll`/`beforeEach`; reset with `setMailMode("production")` (or rely on test runner isolation).
 - **Per-mail handlers don't replace global ones** — both fire. Avoid double-counting metrics.
@@ -3919,9 +4133,9 @@ description: 'Send HTTP responses via @warlock.js/core''s Response helpers — s
 ## The shape
 
 ```ts
-import type { RequestHandler, Response } from "@warlock.js/core";
+import type { RequestHandler } from "@warlock.js/core";
 
-export const myController: RequestHandler = async (request, response: Response) => {
+export const myController: RequestHandler = async ({ request, response }) => {
   // …choose a helper and return it
   return response.success({ data: "…" });
 };
@@ -3931,11 +4145,11 @@ Always `return response.<helper>(...)`. The return value drives Fastify's send.
 
 ## Success helpers
 
-| Method                              | Status | When                                      |
-| ----------------------------------- | ------ | ----------------------------------------- |
-| `response.success(data?)`           | 200    | normal read / update                      |
-| `response.successCreate(data)`      | 201    | resource created (POST)                   |
-| `response.noContent()`              | 204    | delete succeeded, no body needed          |
+| Method                         | Status | When                             |
+| ------------------------------ | ------ | -------------------------------- |
+| `response.success(data?)`      | 200    | normal read / update             |
+| `response.successCreate(data)` | 201    | resource created (POST)          |
+| `response.noContent()`         | 204    | delete succeeded, no body needed |
 
 ```ts
 return response.success({ products: [...] });
@@ -3949,13 +4163,13 @@ return response.noContent();
 
 ## Client-error helpers
 
-| Method                                              | Status | When                                  |
-| --------------------------------------------------- | ------ | ------------------------------------- |
-| `response.badRequest(data)`                         | 400    | malformed or invalid input            |
-| `response.unauthorized(data?)`                      | 401    | missing/invalid auth token            |
-| `response.forbidden(data?)`                         | 403    | authenticated but not allowed         |
-| `response.notFound(data?)`                          | 404    | record missing                        |
-| `response.conflict(data?)`                          | 409    | uniqueness violation, state conflict  |
+| Method                         | Status | When                                 |
+| ------------------------------ | ------ | ------------------------------------ |
+| `response.badRequest(data)`    | 400    | malformed or invalid input           |
+| `response.unauthorized(data?)` | 401    | missing/invalid auth token           |
+| `response.forbidden(data?)`    | 403    | authenticated but not allowed        |
+| `response.notFound(data?)`     | 404    | record missing                       |
+| `response.conflict(data?)`     | 409    | uniqueness violation, state conflict |
 
 ```ts
 return response.badRequest({ error: t("validation.invalid") });
@@ -3974,8 +4188,8 @@ Most error helpers accept an optional payload — if you omit it, they send a de
 ## Redirects
 
 ```ts
-return response.redirect("/login");                    // 302
-return response.redirect("/new-home", 301);            // permanent
+return response.redirect("/login"); // 302
+return response.redirect("/new-home", 301); // permanent
 ```
 
 ## Files
@@ -4007,19 +4221,19 @@ stream.end();
 
 ## Throwing HTTP errors
 
-Most of the time, controllers don't need to *choose* an error helper — they throw from the service layer instead. The request middleware (`http/middleware/inject-request-context.ts`) catches every `HttpError` subclass and produces the matching response. The error classes mirror the helpers above:
+Most of the time, controllers don't need to _choose_ an error helper — they throw from the service layer instead. The request middleware (`http/middleware/inject-request-context.ts`) catches every `HttpError` subclass and produces the matching response. The error classes mirror the helpers above:
 
 ```ts
 import {
-  ResourceNotFoundError,   // 404
-  UnAuthorizedError,        // 401
-  ForbiddenError,           // 403
-  BadRequestError,          // 400
-  ConflictError,            // 409
-  NotAcceptableError,       // 406
-  NotAllowedError,          // 405
-  ServerError,              // 500
-  HttpError,                // base class — `new HttpError(status, message, payload?)` for arbitrary codes
+  ResourceNotFoundError, // 404
+  UnAuthorizedError, // 401
+  ForbiddenError, // 403
+  BadRequestError, // 400
+  ConflictError, // 409
+  NotAcceptableError, // 406
+  NotAllowedError, // 405
+  ServerError, // 500
+  HttpError, // base class — `new HttpError(status, message, payload?)` for arbitrary codes
 } from "@warlock.js/core";
 
 throw new ResourceNotFoundError("product.notFound");
@@ -4027,13 +4241,27 @@ throw new ForbiddenError("permission.denied", { resource: "product", id });
 throw new ConflictError("user.duplicateEmail");
 ```
 
-Each class takes `(message, payload?)`. The payload merges into the response body alongside `error`. In development mode, the stack trace is included too.
+Each class takes `(message, payload?)`. The framework keeps the optional
+detail nested under `payload`:
+
+```json
+{
+  "error": "Product not found",
+  "payload": { "id": 42 }
+}
+```
+
+Every unhandled error response also carries
+`Cache-Control: private, no-store`, regardless of status. The floor is
+applied once at the shared error funnel, so API-route errors cannot be stored
+and replayed across users. In development mode, the stack trace is included
+too.
 
 Pick the class, throw from the service or use-case, and forget about response shaping at the call site. The controller stays focused on the success path:
 
 ```ts
-export const getProductController: RequestHandler = async (request, response) => {
-  const product = await getProductService(request.input("id"));   // throws ResourceNotFoundError on miss
+export const getProductController: RequestHandler = async ({ request, response }) => {
+  const product = await getProductService(request.input("id")); // throws ResourceNotFoundError on miss
   return response.success({ product });
 };
 ```
@@ -4045,9 +4273,9 @@ See [`create-controller`](../create-controller/SKILL.md) for the "throw from ser
 ```ts
 const sse = response.sse();
 
-sse.send("tick", { count: 1 });             // event name, data, optional id
-sse.send("tick", { count: 2 }, "msg-2");    // third arg is the SSE event id
-sse.comment("keep-alive");                  // invisible to the client, prevents timeout
+sse.send("tick", { count: 1 }); // event name, data, optional id
+sse.send("tick", { count: 2 }, "msg-2"); // third arg is the SSE event id
+sse.comment("keep-alive"); // invisible to the client, prevents timeout
 sse.end();
 ```
 
@@ -4087,11 +4315,11 @@ response.clearCookie("session_id");
 
 Every response cookie gets `httpOnly: true`, `sameSite: "lax"`, and `secure: true` outside development, unless you override them:
 
-| Flag | Default | Why it's the default |
-|---|---|---|
-| `httpOnly` | `true` | without it, any injected script can read the cookie |
-| `sameSite` | `"lax"` | without it, the cookie rides along on cross-site requests |
-| `secure` | `true`, except in development | without it, the cookie travels in cleartext |
+| Flag       | Default                       | Why it's the default                                      |
+| ---------- | ----------------------------- | --------------------------------------------------------- |
+| `httpOnly` | `true`                        | without it, any injected script can read the cookie       |
+| `sameSite` | `"lax"`                       | without it, the cookie rides along on cross-site requests |
+| `secure`   | `true`, except in development | without it, the cookie travels in cleartext               |
 
 `secure` is relaxed in development only — browsers drop a `Secure` cookie over plain http, which would silently break every local login. It stays on in test and staging.
 
@@ -4522,12 +4750,17 @@ Set `STORAGE_DRIVER=r2` in production, leave unset in dev — same code uses loc
 ### Uploading a request file
 
 ```ts
-import type { RequestHandler, Response } from "@warlock.js/core";
+import { type GuardedRequestHandler } from "app/auth/requests/guarded.request";
 import { storage } from "@warlock.js/core";
 
-export const uploadAvatarController: RequestHandler = async (request, response: Response) => {
+export const uploadAvatarController: GuardedRequestHandler = async ({ request, response }) => {
   const upload = request.file("avatar");
-  const file = await storage.put(upload, `avatars/${request.user.id}/${upload.fileName}`);
+
+  if (!upload) {
+    return response.badRequest({ error: "missing file" });
+  }
+
+  const file = await storage.put(upload, `avatars/${request.user.id}/${upload.name}`);
 
   return response.successCreate({ url: file.url, hash: file.hash });
 };
@@ -5442,8 +5675,8 @@ Multipart uploads come in as `UploadedFile` instances. The class wraps Fastify's
 
 ## The shape
 
-```ts title="src/app/uploads/schema/index.ts"
-import { v } from "@warlock.js/seal";
+```ts title="src/app/uploads/schema/upload-avatar.schema.ts"
+import { v, type Infer } from "@warlock.js/seal";
 
 export const uploadAvatarSchema = v.object({
   avatar: v
@@ -5452,16 +5685,18 @@ export const uploadAvatarSchema = v.object({
     .maxSize({ unit: "MB", size: 5 })
     .mimeType(["image/jpeg", "image/png", "image/webp"]),
 });
+
+export type UploadAvatarSchema = Infer<typeof uploadAvatarSchema>;
 ```
 
 ```ts title="src/app/uploads/controllers/upload-avatar.controller.ts"
-import { type GuardedRequestHandler } from "app/auth/types/guarded-request.type";
+import { type GuardedRequestHandler } from "app/auth/requests/guarded.request";
 import { type UploadAvatarSchema, uploadAvatarSchema } from "../schema/upload-avatar.schema";
 
-export const uploadAvatarController: GuardedRequestHandler<UploadAvatarSchema> = async (
+export const uploadAvatarController: GuardedRequestHandler<UploadAvatarSchema> = async ({
   request,
   response,
-) => {
+}) => {
   const { avatar } = request.validated();
 
   const file = await avatar
@@ -5487,7 +5722,7 @@ Inside a controller:
 ```ts
 import type { RequestHandler, UploadedFile } from "@warlock.js/core";
 
-export const uploadController: RequestHandler = async (request, response) => {
+export const uploadController: RequestHandler = async ({ request, response }) => {
   // option A — direct from request, no validation
   const file: UploadedFile | undefined = request.file("avatar");
 
@@ -5669,7 +5904,7 @@ export const uploadFilesSchema = v.object({
 ```ts title="src/app/uploads/controllers/create-upload.controller.ts"
 import type { RequestHandler } from "@warlock.js/core";
 
-export const createUploadController: RequestHandler = async (request, response) => {
+export const createUploadController: RequestHandler = async ({ request, response }) => {
   const { files } = request.validated();
 
   const saved = await Promise.all(
@@ -5966,9 +6201,9 @@ const template = await readFile(appPath("mailers/templates/welcome.html"), "utf-
 ### Health endpoint
 
 ```ts title="src/app/system/controllers/health.controller.ts"
-import { Application, type RequestHandler, type Response } from "@warlock.js/core";
+import { Application, type RequestHandler } from "@warlock.js/core";
 
-export const healthController: RequestHandler = async (_request, response: Response) => {
+export const healthController: RequestHandler = async ({ response }) => {
   return response.success({
     status: "ok",
     environment: Application.environment,
@@ -6267,10 +6502,14 @@ The error's message is locale-aware — the `inject-request-context` middleware 
 ### Translated response message in a controller
 
 ```ts
-export const createProductController: GuardedRequestHandler<CreateProductSchema> = async (
+import { type GuardedRequestHandler } from "app/auth/requests/guarded.request";
+import { type CreateProductSchema } from "../schema/create-product.schema";
+import { createProductService } from "../services/create-product.service";
+
+export const createProductController: GuardedRequestHandler<CreateProductSchema> = async ({
   request,
   response,
-) => {
+}) => {
   const product = await createProductService(request.validated());
   return response.success({
     message: request.t("products.created"),
@@ -6455,16 +6694,25 @@ export default {
 
 ⚠ **Since 4.13.0 `http.trustProxy` defaults to `false`**, so `request.detectIp()` returns the socket address and **`X-Real-IP` / `X-Forwarded-For` are ignored unless you opt in.** Before 4.13.0 the default was `true`, which meant any client could set its own forwarding header and be believed.
 
-⚠ **Opt in with the narrowest shape your topology allows, not with `true`.** Since 4.15.0 `http.trustProxy` takes a hop count or a trusted-proxy list, and `detectIp()` resolves the chain the same way Fastify's `request.ip` does:
+⚠ **Opt in with the narrowest shape your topology allows, not with `true`.** `http.trustProxy` takes a trusted-proxy list, and `detectIp()` resolves the chain the same way Fastify's `request.ip` does:
 
 | `http.trustProxy` | Client IP |
 | --- | --- |
 | `false` *(default)* | Socket peer address |
-| `2` | Walks past the 2 rightmost `X-Forwarded-For` hops — for an edge that **appends** (the usual case: nginx, ALB, most CDNs) |
-| `"10.0.0.0/8"` / `["10.0.0.0/8", "192.168.0.0/16"]` | Walks left while each hop is a listed proxy |
+| `"10.0.0.0/8"` / `"loopback, 10.0.0.0/8"` / `["10.0.0.0/8", "192.168.0.0/16"]` | Walks left while each hop is a listed proxy, stops at the first that isn't |
+| `(address, hop) => boolean` | Your own predicate |
 | `true` | Trusts the whole chain — the leftmost hop, i.e. **whatever the client put there** if your edge appends rather than overwrites |
 
-With `true`, any client that can reach the process directly picks its own IP and this allowlist is decorative. `X-Real-IP` is honoured only under `true` — it carries no chain to check a hop count or proxy list against — so if your edge sets only that header, have it set `X-Forwarded-For` too.
+⚠ **Since 5.2 the value is validated at boot, and a hop count is refused.** The accepted shapes are exactly `boolean`, a non-empty string (comma-separated IPs/CIDRs), a non-empty `string[]`, and an `(address, hop) => boolean` predicate. Missing or nullish means `false`. Anything else — a **number**, `""`, `[]`, a mixed array, a plain object — throws a `TypeError` while the HTTP server is being constructed instead of being silently coerced:
+
+```
+Invalid http.trustProxy configuration: expected a boolean, a non-empty IP/CIDR string,
+a non-empty string array, or a predicate function; received number.
+```
+
+A hop count (`trustProxy: 2`) used to be documented as the shape to prefer. It is now refused **loudly**, because the Fastify version Warlock builds against treats a number as always-false at runtime: it silently degraded to "trust nothing" rather than walking past your proxies. Express the same topology as a proxy list (`"10.0.0.0/8"`) or a predicate.
+
+With `true`, any client that can reach the process directly picks its own IP and this allowlist is decorative. `X-Real-IP` is honoured only under `true` — it carries no chain to check a proxy list against — so if your edge sets only that header, have it set `X-Forwarded-For` too.
 
 ```ts
 import { middleware } from "@warlock.js/core";
@@ -6638,7 +6886,7 @@ What it does at save time:
 | Existing row, password unchanged | Pass through (no re-hashing — stored hash preserved). |
 | Empty / undefined value         | Pass through untouched.                     |
 
-Calls `authService.hashPassword(String(value))` under the hood — same bcryptjs path as the standalone `hashPassword()` helper. See [`hash-password/SKILL.md`](../hash-password/SKILL.md) for full bcrypt setup (salt rounds, `yarn add bcryptjs`).
+Calls `authService.hashPassword(String(value))` under the hood — same bcryptjs path as the standalone `hashPassword()` helper. See [`hash-password/SKILL.md`](../hash-password/SKILL.md) for full bcrypt setup (salt rounds, `pnpm add bcryptjs`).
 
 ### Why declarative wins
 
@@ -6792,7 +7040,7 @@ Rule of thumb: transformers are for **pure, deterministic** transforms of the ro
 
 ## See also
 
-- [`hash-password/SKILL.md`](../hash-password/SKILL.md) — the bcrypt setup that `useHashedPassword` calls under the hood; salt rounds, `yarn add bcryptjs`.
+- [`hash-password/SKILL.md`](../hash-password/SKILL.md) — the bcrypt setup that `useHashedPassword` calls under the hood; salt rounds, `pnpm add bcryptjs`.
 - [`use-repository/SKILL.md`](../use-repository/SKILL.md) — where `create` / `save` calls happen that trigger the transformers.
 - [`define-resource/SKILL.md`](../define-resource/SKILL.md) — filtering transformed fields (`password`) out of API responses.
 - [`warlock-conventions/SKILL.md`](../warlock-conventions/SKILL.md) — schema files live in `src/app/<module>/models/<entity>/<entity>.model.ts`.
@@ -6855,7 +7103,7 @@ Five lines do the heavy lifting:
 4. **`defaultOptions`** — applied to every call (`orderBy`, default `limit`, etc.).
 5. **`new FaqsRepository()`** singleton — import this everywhere; never instantiate again.
 
-The class is intentionally private — only the singleton escapes the module. Scaffold with `yarn warlock generate.repository <module>/<entity>`.
+The class is intentionally private — only the singleton escapes the module. Scaffold with `pnpm warlock generate.repository <module>/<entity>`.
 
 ## The `filterBy` rules
 
@@ -7078,10 +7326,10 @@ export async function listFaqsService(filters: FaqListOptions) {
 ```
 
 ```ts title="src/app/faqs/controllers/list-faqs.controller.ts"
-import type { RequestHandler, Response } from "@warlock.js/core";
+import { type GuardedRequestHandler } from "app/auth/requests/guarded.request";
 import { listFaqsService } from "../services/list-faqs.service";
 
-export const listFaqsController: RequestHandler = async (request, response: Response) => {
+export const listFaqsController: GuardedRequestHandler = async ({ request, response }) => {
   const { data, pagination } = await listFaqsService({
     ...request.all(),
     organization_id: request.user.organizationId,
@@ -7232,6 +7480,177 @@ The third arg is a context object — `{ allValues, dateFormat, ... }` — for f
 - [`warlock-conventions/SKILL.md`](../warlock-conventions/SKILL.md) — controller → service → repository → model layering.
 
 
+## use-request-locals  `@warlock.js/core/use-request-locals/SKILL.md`
+
+---
+name: use-request-locals
+description: 'Carry typed, server-only data through one HTTP request with `request.locals`, usually written by middleware and read by downstream middleware or controllers. Augment `RequestLocals` in the module that owns each key; v5 no longer permits arbitrary `request.foo` properties. Triggers: `request.locals`, `RequestLocals`, `request.post`, `request.organization`, `Property does not exist on type Request`, `Request index signature`; "attach data to a request", "share middleware data with a controller", "type request locals", "migrate dynamic request properties"; typical type augmentation `declare module "@warlock.js/core" { interface RequestLocals { ... } }`. Skip: computed-on-demand single-flight values and removed `fromRequest` — `@warlock.js/core/request-memo/SKILL.md`; middleware mechanics — `@warlock.js/core/write-middleware/SKILL.md`; authenticated user typing — augment `RequestUser`, not `RequestLocals`; competing patterns: `(request as any).foo`, `request.set()`, module-global mutable state.'
+---
+
+# Warlock — use typed request locals
+
+`request.locals` is the v5 home for private data that middleware writes and downstream code reads during the same request. It is separate from client input and starts as a fresh object on every `Request` instance.
+
+## The exact declarations
+
+From `core/src/http/types.ts`:
+
+```ts
+export interface RequestLocals {}
+```
+
+From `core/src/http/request.ts`:
+
+```ts
+public locals: RequestLocals = {};
+```
+
+`RequestLocals` is intentionally empty and augmentable. It has no index signature: declare owned keys explicitly so reads and writes have their real types instead of `any`.
+
+## Migrate a middleware attachment from v4 to v5
+
+### Before — v4 dynamic `Request` property
+
+```ts title="src/app/observability/middleware/request-timing.middleware.ts"
+import type { Middleware } from "@warlock.js/core";
+
+export const requestTimingMiddleware: Middleware = (request) => {
+  request.startedAt = Date.now();
+};
+```
+
+```ts title="src/app/observability/controllers/timing.controller.ts"
+import type { RequestHandler } from "@warlock.js/core";
+
+export const timingController: RequestHandler = async ({ request, response }) => {
+  return response.success({ elapsedMs: Date.now() - request.startedAt });
+};
+```
+
+Those arbitrary properties compiled in v4 because `Request` had a `[key: string]: any` index signature. That signature is gone in v5.
+
+### After — v5 typed `request.locals`
+
+Declare the key once in the feature that owns and writes it:
+
+```ts title="src/app/observability/request-locals.d.ts"
+declare module "@warlock.js/core" {
+  interface RequestLocals {
+    startedAt?: number;
+  }
+}
+
+export {};
+```
+
+Write it in middleware:
+
+```ts title="src/app/observability/middleware/request-timing.middleware.ts"
+import type { Middleware } from "@warlock.js/core";
+
+export const requestTimingMiddleware: Middleware = ({ request }) => {
+  request.locals.startedAt = Date.now();
+};
+```
+
+Read it downstream:
+
+```ts title="src/app/observability/controllers/timing.controller.ts"
+import type { RequestHandler } from "@warlock.js/core";
+
+export const timingController: RequestHandler = async ({ request, response }) => {
+  const startedAt = request.locals.startedAt;
+
+  if (startedAt === undefined) {
+    return response.serverError({ error: "request timing middleware did not run" });
+  }
+
+  return response.success({ elapsedMs: Date.now() - startedAt });
+};
+```
+
+The `?` is honest about runtime ordering: the type exists everywhere, but the value exists only after the middleware runs. Narrow it downstream unless every construction path guarantees initialization and your project deliberately declares the key as required.
+
+## Augment with an application type
+
+An augmentation file may import the value's type. Keeping the declaration beside the writer makes ownership visible and prevents unrelated packages from claiming the same key.
+
+```ts title="src/app/organizations/request-locals.d.ts"
+import type { Organization } from "./models/organization";
+
+declare module "@warlock.js/core" {
+  interface RequestLocals {
+    organization?: Organization;
+  }
+}
+
+export {};
+```
+
+The module specifier must be `"@warlock.js/core"`, matching the public package import whose `RequestLocals` interface is exported.
+
+## Where the augmentation file goes
+
+A new project scaffolds `src/typings.d.ts` and lists it explicitly in `tsconfig.json`'s `include`. That is the sanctioned home for application-wide augmentations — `RequestLocals` and `RequestUser` both ship there as empty `interface` declarations with the reasoning written above them.
+
+```ts title="src/typings.d.ts"
+declare module "@warlock.js/core" {
+  interface RequestLocals {}
+
+  interface RequestUser {}
+}
+
+export {};
+```
+
+Feature-local files such as `src/app/organizations/request-locals.d.ts` are equally valid and keep ownership next to the middleware that writes the key; the scaffold's `include` covers all of `src`. Use `src/typings.d.ts` for declarations no single feature owns.
+
+Two rules the scaffold's own comments spell out, and both bite silently:
+
+- **Keep the trailing `export {}`.** `declare module "x"` inside a file with no top-level import or export declares an _ambient_ module, which REPLACES `@warlock.js/core`'s real typings instead of merging into them — every framework export vanishes. The `export {}` is what makes the file a module and the block an augmentation. It is not an unused statement to clean up.
+- **Keep them `interface`, not `type`.** This project otherwise prefers `type`; these are the named exception, because declaration merging is interface-only. `type RequestUser = { ... }` is a duplicate-identifier error, not an augmentation.
+
+On a project scaffolded before 5.1 there is no `src/typings.d.ts`, and `tsconfig.json` carries `"typeRoots": ["./src/typings.d.ts"]` — wrong twice, since `typeRoots` takes directories of `@types` packages rather than files, and that file did not exist. Drop the `typeRoots` entry, create the file, and list it under `include`.
+
+## What belongs in `locals`
+
+Good fits are values explicitly produced by one stage and consumed by later stages:
+
+- a resolved organization, session, feature flag, or authorization subject;
+- request timing or tracing metadata;
+- a model loaded by validation or routing middleware;
+- private server state that must not appear in request input.
+
+`locals` is not a cache API. If consumers should be able to ask for a value independently and concurrent calls must collapse into one loader, use `requestMemo()` instead.
+
+## Isolation from input and other requests
+
+`Request` initializes `locals` with `{}` for each new request. Request instances are not pooled, so values cannot carry into the next request.
+
+Writing `request.locals.organization` does not affect `request.all()`, `request.input()`, or `request.validated()`. By contrast, `request.set()` writes into the input payload's `all` bag, so it is the wrong replacement for a private v4 attachment.
+
+## Choosing the extension surface
+
+- Use `request.locals` for per-request data written by middleware and read downstream.
+- Use `requestMemo(key, fn)` for lazily computed, single-flight work scoped to the active request.
+- Augment `Request` itself only for a genuine new typed member that also has a runtime implementation.
+- Augment `RequestUser` for the authenticated `request.user` shape; do not duplicate it under locals merely to work around typing.
+
+## Gotchas
+
+- **Do not restore `(request as any).post`.** It recreates the exact unchecked behavior v5 removed.
+- **Do not add `[key: string]: any` to `RequestLocals`.** Declare each key with its actual type; otherwise every typo becomes valid again.
+- **Do not centralize keys owned by unrelated features.** The middleware or package that writes a key should own its augmentation.
+- **Do not assume an optional local was initialized.** Middleware registration and ordering are runtime concerns; narrow the value or fail clearly downstream.
+- **Avoid key collisions across augmentations.** Interface merging requires repeated property declarations to agree, but stable feature-prefixed names are clearer for generic metadata.
+
+## See also
+
+- [`request-memo/SKILL.md`](../request-memo/SKILL.md) — the `fromRequest()` migration and single-flight request memoization.
+- [`write-middleware/SKILL.md`](../write-middleware/SKILL.md) — middleware execution and registration.
+- [`create-controller/SKILL.md`](../create-controller/SKILL.md) — reading locals in downstream controllers.
+
+
 ## validate-input  `@warlock.js/core/validate-input/SKILL.md`
 
 ---
@@ -7262,10 +7681,10 @@ import type { Request, RequestHandler } from "@warlock.js/core";
 import { type CreateProductSchema, createProductSchema } from "../schema/create-product.schema";
 import { createProductService } from "../services/create-product.service";
 
-export const createProductController: RequestHandler<Request<CreateProductSchema>> = async (
+export const createProductController: RequestHandler<Request<CreateProductSchema>> = async ({
   request,
   response,
-) => {
+}) => {
   const product = await createProductService(request.validated());
 
   return response.successCreate({ product });
@@ -7283,7 +7702,7 @@ Two pieces, always:
 
 No separate `*.request.ts` alias file. `RequestHandler<Request<TSchema>>` types `request.validated()` directly off the schema's inferred type.
 
-Scaffold with `yarn warlock generate.controller <module>/<action> --with-validation`. If the scaffolder emits a `requests/<action>.request.ts` file, delete it — the inline pattern is the convention.
+Scaffold with `pnpm warlock generate.controller <module>/<action> --with-validation`. If the scaffolder emits a `requests/<action>.request.ts` file, delete it — the inline pattern is the convention.
 
 ## The `v.*` factory surface
 
@@ -7550,7 +7969,7 @@ This skill is the foundation. Every other warlock skill (`register-route`, `crea
 2. **Several files are auto-loaded — never `import` them.** The dev-server file watcher and the production builder categorize these as "special" and load them on boot.
    - `src/app/<module>/routes.ts` — route declarations
    - `src/app/<module>/main.ts` — per-module one-time setup
-   - `src/app/main.ts` — **project-level** one-time setup (where `connectorsManager.register(...)`, global hooks, etc. live)
+   - `src/app/main.ts` — **project-level** one-time application setup (global hooks and other app initialization; connector instances belong in `warlock.config.ts > connectors`)
    - `src/app/<module>/events/*.ts(x)` — **any** `.ts(x)` file inside the `events/` folder (the `*.event.ts` suffix is convention, not a framework requirement)
    - `src/app/<module>/utils/locales.ts` — module translations via `groupedTranslations(...)`
    - `src/config/*.ts(x)` — subsystem config files
@@ -7575,11 +7994,11 @@ This skill is the foundation. Every other warlock skill (`register-route`, `crea
    ```
 
    ```ts title="src/app/<module>/controllers/create-<thing>.controller.ts"
-   import { type GuardedRequestHandler } from "app/auth/types/guarded-request.type";
+   import { type GuardedRequestHandler } from "app/auth/requests/guarded.request";
    import { type CreateThingSchema, createThingSchema } from "../schema/create-thing.schema";
    import { createThingService } from "../services/create-thing.service";
 
-   export const createThingController: GuardedRequestHandler<CreateThingSchema> = async (request, response) => {
+   export const createThingController: GuardedRequestHandler<CreateThingSchema> = async ({ request, response }) => {
      const thing = await createThingService(request.validated());
      return response.success({ thing });
    };
@@ -7651,9 +8070,13 @@ import { Product } from "../../../products/models/product";
 
 Within the same module, use relative paths (`./`, `../`).
 
+## Type augmentations
+
+`src/typings.d.ts` is the project's module-augmentation file. It ships with the scaffold, is listed explicitly in `tsconfig.json`'s `include`, and is where application-wide `declare module "@warlock.js/core"` blocks live — `RequestLocals` and `RequestUser` are already there as empty interfaces. Keep its trailing `export {}` (without it the block declares an ambient module and erases the framework's real typings) and keep the augmented declarations as `interface`, the one sanctioned exception to this project's prefer-`type` rule, since declaration merging is interface-only. See [`use-request-locals`](../use-request-locals/SKILL.md).
+
 ## Decorators
 
-Cascade uses `@RegisterModel()` for the model registry and `@BelongsTo` / `@HasMany` / `@MorphTo` for relations. The scaffolded `tsconfig.json` has `"experimentalDecorators": true`. If you ever see "model not registered" errors at runtime, check that flag first.
+Cascade uses `@RegisterModel()` for the model registry and `@BelongsTo` / `@HasMany` / `@MorphTo` for relations. The scaffolded `tsconfig.json` has `"experimentalDecorators": false` — these are native Stage-3 decorators, not legacy. Never set that flag to `true`; see [`lower-stage3-decorators`](../lower-stage3-decorators/SKILL.md).
 
 ## See also
 
@@ -7666,7 +8089,7 @@ Cascade uses `@RegisterModel()` for the model registry and `@BelongsTo` / `@HasM
 
 ---
 name: warlock-doctor
-description: 'Run `warlock doctor` — a read-only diagnostics command that checks routes / config / connectors / optional-peers / health endpoints / release hygiene and prints a pass/warn/fail report, exiting non-zero on any failure. Add your own probe with the `DoctorCheck` contract and `runChecks` / `formatReportLines`. Triggers: `warlock doctor`, `doctorCommand`, `DoctorCheck`, `CheckResult`, `CheckStatus`, `DoctorReport`, `runChecks`, `formatReportLines`, `printReport`, `defaultDoctorChecks`; "diagnose my app", "preflight / preflight check", "is the app healthy", "why are there 0 routes", "pre-release sanity check", "CI smoke check"; run as `yarn warlock doctor`. Skip: the live `/health` + `/ready` HTTP probes — `@warlock.js/core/health-checks/SKILL.md`; authoring a general CLI command — `@warlock.js/core/write-cli-command/SKILL.md`; releasing the package — `releasing-warlock-monorepo`; competing tools `npm doctor`, `nest info`, hand-rolled preflight scripts.'
+description: 'Run `warlock doctor` — a read-only diagnostics command that checks routes / config / connectors / optional-peers / health endpoints / release hygiene and prints a pass/warn/fail report, exiting non-zero on any failure. Add your own probe with the `DoctorCheck` contract and `runChecks` / `formatReportLines`. Triggers: `warlock doctor`, `doctorCommand`, `DoctorCheck`, `CheckResult`, `CheckStatus`, `DoctorReport`, `runChecks`, `formatReportLines`, `printReport`, `defaultDoctorChecks`; "diagnose my app", "preflight / preflight check", "is the app healthy", "why are there 0 routes", "pre-release sanity check", "CI smoke check"; run as `pnpm warlock doctor`. Skip: the live `/health` + `/ready` HTTP probes — `@warlock.js/core/health-checks/SKILL.md`; authoring a general CLI command — `@warlock.js/core/write-cli-command/SKILL.md`; releasing the package — `releasing-warlock-monorepo`; competing tools `npm doctor`, `nest info`, hand-rolled preflight scripts.'
 ---
 
 # Warlock — `warlock doctor`
@@ -7674,7 +8097,7 @@ description: 'Run `warlock doctor` — a read-only diagnostics command that chec
 `warlock doctor` is a read-only preflight. It boots the app far enough to introspect it — loads every config file and bootstrap code so routes and connectors register — but **starts no connectors**, so it never opens a database, cache, or socket connection. It then runs a set of checks and prints a grouped pass / warn / fail report.
 
 ```bash
-yarn warlock doctor
+pnpm warlock doctor
 ```
 
 ```
@@ -7777,7 +8200,7 @@ if (report.hasFailures) process.exit(report.exitCode);
 ### CI / pre-release gate
 
 ```bash
-yarn warlock doctor || exit 1   # non-zero exit fails the job
+pnpm warlock doctor || exit 1   # non-zero exit fails the job
 ```
 
 A red `release-hygiene` line catches the classic "bumped `package.json` but forgot the CHANGELOG heading" mistake before a publish.
@@ -7805,7 +8228,7 @@ A `⚠ routes: 0 routes registered` line is the tell that a route module threw o
 
 ---
 name: warlock-routes
-description: 'Run `warlock routes` — a read-only command that lists the registered HTTP routes as a verb-colored table (method / path / name / action / middleware-count / source), a sibling of `warlock doctor`. Filter with `--method` / `--path` / `--name`, or emit normalized rows as JSON with `--json`. Triggers: `warlock routes`, `routesCommand`, "list my routes", "show all routes", "route table", "what endpoints does my app expose", "dump routes as JSON", "which routes have middleware", "route map for CI"; run as `yarn warlock routes`. Skip: read-only health/preflight checks — `@warlock.js/core/warlock-doctor/SKILL.md`; defining/naming/grouping routes — `@warlock.js/core/register-route/SKILL.md`; authoring a general CLI command — `@warlock.js/core/write-cli-command/SKILL.md`; competing tools `nest`/`express` route listers, `php artisan route:list`.'
+description: 'Run `warlock routes` — a read-only command that lists the registered HTTP routes as a verb-colored table (method / path / name / action / middleware-count / source), a sibling of `warlock doctor`. Filter with `--method` / `--path` / `--name`, or emit normalized rows as JSON with `--json`. Also covers `warlock routes:diff`, which compares live page routes against the last `warlock build`''s route snapshot and exits non-zero on drift. Triggers: `warlock routes`, `routesCommand`, `warlock routes:diff`, `routesDiffCommand`, "list my routes", "show all routes", "route table", "what endpoints does my app expose", "dump routes as JSON", "which routes have middleware", "route map for CI", "did my page routes drift from the last build"; run as `pnpm warlock routes` / `pnpm warlock routes:diff`. Skip: read-only health/preflight checks — `@warlock.js/core/warlock-doctor/SKILL.md`; defining/naming/grouping routes — `@warlock.js/core/register-route/SKILL.md`; authoring a general CLI command — `@warlock.js/core/write-cli-command/SKILL.md`; competing tools `nest`/`express` route listers, `php artisan route:list`.'
 ---
 
 # Warlock — `warlock routes`
@@ -7813,7 +8236,7 @@ description: 'Run `warlock routes` — a read-only command that lists the regist
 `warlock routes` lists every registered HTTP route as a table. It's the read-only sibling of [`warlock doctor`](../warlock-doctor/SKILL.md): it boots the app far enough to register route modules — but **starts no connectors**, so it never opens a database, cache, or socket connection.
 
 ```bash
-yarn warlock routes
+pnpm warlock routes
 ```
 
 ```
@@ -7844,10 +8267,10 @@ The `METHOD` column is verb-colored (GET green, POST blue, PUT/PATCH yellow, DEL
 Optional, case-insensitive, AND-combined:
 
 ```bash
-yarn warlock routes --method GET     # -m  exact HTTP method
-yarn warlock routes --path /users    # -p  path substring
-yarn warlock routes --name users     # -n  route-name substring
-yarn warlock routes -m POST -p /users
+pnpm warlock routes --method GET     # -m  exact HTTP method
+pnpm warlock routes --path /users    # -p  path substring
+pnpm warlock routes --name users     # -n  route-name substring
+pnpm warlock routes -m POST -p /users
 ```
 
 ## JSON output
@@ -7855,7 +8278,7 @@ yarn warlock routes -m POST -p /users
 `--json` (`-j`) emits the normalized rows instead of the table — for `jq`, a CI diff, or a generated API map. Filters apply before serialization.
 
 ```bash
-yarn warlock routes --json
+pnpm warlock routes --json
 ```
 
 ```json
@@ -7869,7 +8292,7 @@ yarn warlock routes --json
 ### Audit which routes are guarded
 
 ```bash
-yarn warlock routes --json | jq '[.[] | select(.middleware == 0)]'
+pnpm warlock routes --json | jq '[.[] | select(.middleware == 0)]'
 ```
 
 Surfaces public routes (no middleware) — a quick check that auth-protected paths actually carry a guard.
@@ -7877,10 +8300,47 @@ Surfaces public routes (no middleware) — a quick check that auth-protected pat
 ### Confirm a route registered
 
 ```bash
-yarn warlock routes --name users.create
+pnpm warlock routes --name users.create
 ```
 
 An empty result means the route isn't registered — re-run `warlock dev` and read the boot error (the route-module loader is fail-loud, so a throwing route file aborts boot rather than being silently dropped).
+
+## `warlock routes:diff` — catch page-route drift before it ships
+
+Compares the **live dev-server page routes** (`router.list().filter(r => r.isPage)`) against a **snapshot written by the last successful `warlock build`** (`page-routes.manifest.json` in `resolveBuildConfig().outdir`, e.g. `dist/page-routes.manifest.json`). Boots the same diagnostic way as `warlock routes` — route modules registered, no connectors started — then diffs.
+
+```bash
+pnpm warlock routes:diff
+```
+
+```
+Page routes match (4 routes).
+Note: page names are compared as DERIVED by the build, so a clean diff does not prove
+that no route name collided at registration (the router appends `.<method>` to a name
+already claimed by another method). Run `warlock routes` to see the registered names.
+```
+
+**A clean baseline is now expected immediately after a successful `warlock build`.** Through 5.1, running `routes:diff` on an untouched checkout right after a green build reported drift, because the manifest recorded the catch-all as `"*"` while the router serves it as `"/*"`. The manifest is now written through the router's own path normalizer, so the two sides agree and a clean tree reports clean. If you see drift on a tree you have not edited since building, that is a bug worth reporting — it is no longer the expected greeting.
+
+⚠ **What a clean diff does NOT prove.** The manifest records what each page's name was **derived** as, not what it was **registered** as. `warlock build` never boots connectors, so it cannot see the API routes a page name might collide with; when a name is already claimed by another method the router appends a `.<method>` suffix at registration, and the comparison accepts that suffix rather than reporting it as drift. So `Page routes match` means *the page surface did not move since the build* — it does not mean *no page route name collided*. Use `warlock routes` to see the names as actually registered.
+
+or, on drift:
+
+```
+changed - GET /blog/:slug  blog.post (src/web/blog/[slug].page.tsx)
+        + GET /blog/:id    blog.post (src/web/blog/[slug].page.tsx)
+removed - GET /legacy      legacy.home
+added   + GET /promo       promo.home   (src/web/promo.page.tsx)
+Page route drift: 1 changed, 1 removed, 1 added. Run `warlock build` after reviewing these changes.
+```
+
+and exits non-zero.
+
+- **Identity is `method` + `path` + `name`.** A route is only reported `changed` — instead of one `removed` line and one unrelated `added` line — when it shares its **`source` file** with the route it's being paired against. A moved checkout (same source, different absolute path on disk) never shows as drift; a route whose declared path/name literally changed in the same file does.
+- **Requires a prior successful build.** No `page-routes.manifest.json` yet, or a malformed one → the command refuses to run and tells you to `warlock build` first, rather than diffing against nothing.
+- **Fails loudly on a broken dev boot**, same as `warlock routes` / `warlock doctor` — a route module that throws on import, or a connector registration error, aborts before any comparison happens.
+- **Only page routes are compared.** API routes registered without `isPage` never appear on either side of the diff; this command exists for the file-system page-routing surface `@warlock.js/web` adds, not the general route table.
+- **Core reads the snapshot; it does not write it.** `warlock build` writes `page-routes.manifest.json` through a connector's `build`/`emit` contribution (`@warlock.js/web`'s build integration, keyed off pages it discovers) — a project with no `@warlock.js/web` page routes never produces one, and `routes:diff` has nothing to compare against.
 
 ## Gotchas
 
@@ -7893,6 +8353,7 @@ An empty result means the route isn't registered — re-run `warlock dev` and re
 
 - [`warlock-doctor/SKILL.md`](../warlock-doctor/SKILL.md) — the read-only diagnostics sibling; its `routes` check warns when this table would be empty.
 - [`register-route/SKILL.md`](../register-route/SKILL.md) — defining, naming, and grouping the routes this command lists.
+- [`run-app/SKILL.md`](../run-app/SKILL.md) — `warlock build`, the command that produces the snapshot `routes:diff` compares against.
 - [`write-cli-command/SKILL.md`](../write-cli-command/SKILL.md) — the command + `preload` shape `routesCommand` is built from.
 
 
@@ -8023,10 +8484,10 @@ export async function notifyUserService(user: User, payload: unknown) {
 Then from a controller:
 
 ```ts
-import type { GuardedRequestHandler } from "app/auth/types/guarded-request.type";
+import type { GuardedRequestHandler } from "app/auth/requests/guarded.request";
 import { notifyUserService } from "../services/notify-user.service";
 
-export const sendNotificationController: GuardedRequestHandler = async (request, response) => {
+export const sendNotificationController: GuardedRequestHandler = async ({ request, response }) => {
   await notifyUserService(request.user, request.input("payload"));
   return response.success({ delivered: true });
 };
@@ -8188,7 +8649,7 @@ CLI commands, scheduled jobs, queue workers — anything running outside an HTTP
 
 ---
 name: write-cli-command
-description: 'Author a custom `warlock <my-cmd>` command via the `command()` factory — name, description, action, options, preload, then register in `warlock.config.ts > cli.commands` or drop in `src/app/<module>/commands/`. Triggers: `command`, `CLICommand`, `CLICommandPreload`, `CLICommandOption`, `preload`, `preAction`, `persistent`, `colors`; "write a custom warlock command", "one-off maintenance task", "ship a CLI from a package", "framework built-in commands"; typical import `import { command } from "@warlock.js/core"`. Skip: framework dev/build/start — `@warlock.js/core/run-app/SKILL.md`; warlock.config.ts wiring — `@warlock.js/core/configure-app/SKILL.md`; competing libs `commander`, `yargs`, `oclif`.'
+description: 'Author a custom `warlock <my-cmd>` command via the `command()` factory — name, description, action, options, preload, then register in `warlock.config.ts > cli.commands` or drop in `src/app/<module>/commands/`. Also covers built-in `warlock add` feature scaffolding, including the Web starter and `index.register.ts`. Triggers: `command`, `CLICommand`, `CLICommandPreload`, `CLICommandOption`, `preload`, `preAction`, `persistent`, `colors`, `warlock add`, `index.register.ts`; "write a custom warlock command", "one-off maintenance task", "ship a CLI from a package", "framework built-in commands"; typical import `import { command } from "@warlock.js/core"`. Skip: framework dev/build/start — `@warlock.js/core/run-app/SKILL.md`; warlock.config.ts wiring — `@warlock.js/core/configure-app/SKILL.md`; competing libs `commander`, `yargs`, `oclif`.'
 ---
 
 # Warlock — write a CLI command
@@ -8227,7 +8688,7 @@ export default command({
 });
 ```
 
-Run it: `yarn warlock users.promote --email=hasan@example.com` (or `yarn warlock up -e hasan@example.com`).
+Run it: `pnpm warlock users.promote --email=hasan@example.com` (or `pnpm warlock up -e hasan@example.com`).
 
 ## `CLICommandOptions` — the factory input
 
@@ -8393,6 +8854,7 @@ warlock generate                         (alias: g)      — interactive picker
 | Feature       | Installs                                                                                            |
 | ------------- | --------------------------------------------------------------------------------------------------- |
 | `react-email` | `react-email` + `@react-email/components` + `@react-email/render` + `@react-email/tailwind`; drops a `welcome-email.tsx` sample; patches `tsconfig.json` |
+| `web`         | Warlock Web + React stack; scaffolds the application page, localization, contact endpoint, and Web configuration                         |
 | `react`       | `react` + `react-dom` + types                                                                       |
 | `image`       | `sharp` (for the `Image` class)                                                                     |
 | `mail`        | `nodemailer` + types                                                                                |
@@ -8409,6 +8871,8 @@ warlock generate                         (alias: g)      — interactive picker
 | `test`        | `vitest` + `@mongez/vite` + coverage; drops `test-global-setup.ts` / `test-setup.ts` / `vite.config.ts` |
 
 Run `warlock add --list` to see what's currently registered. Pass `--packageManager <yarn\|pnpm\|npm>` to override auto-detection (defaults to whichever lockfile is present).
+
+The Web starter keeps the page's universal non-component setup in `src/web/index.register.ts`, while `src/web/index.page.tsx` re-exports `register`. Warlock still discovers and runs the hook from the page namespace in both SSR and the browser, but editing the page component remains inside React's Fast Refresh boundary. Do not move the `register()` declaration inline beside the component: React Refresh treats that non-component export as incompatible and reloads the page, losing component state.
 
 ### Misc
 
@@ -8499,7 +8963,7 @@ export default command({
 
 ---
 name: write-middleware
-description: 'Author HTTP middleware for @warlock.js/core — the `(request, response)` signature, short-circuit by returning a response, enrich the request with extra fields, register per-route, per-group, or app-wide. Triggers: `Middleware`, `MiddlewareResponse`, `router.group`, `guarded`, `request.detectIp`, `authMiddleware`; "write a custom middleware", "short-circuit a request", "enrich the request with extra fields", "per-route vs per-group middleware"; typical import `import type { Middleware } from "@warlock.js/core"`. Skip: built-in middleware catalog — `@warlock.js/core/use-middleware/SKILL.md`; route attachment — `@warlock.js/core/register-route/SKILL.md`; response helpers — `@warlock.js/core/send-response/SKILL.md`; competing patterns: `express` `(req, res, next)` middleware, Fastify `preHandler` hooks.'
+description: 'Author HTTP middleware for @warlock.js/core — the `({ request, response })` signature, short-circuit by returning a response, enrich the request with extra fields, register per-route, per-group, or app-wide. Triggers: `Middleware`, `MiddlewareResponse`, `router.group`, `guarded`, `request.detectIp`, `authMiddleware`; "write a custom middleware", "short-circuit a request", "enrich the request with extra fields", "per-route vs per-group middleware"; typical import `import type { Middleware } from "@warlock.js/core"`. Skip: built-in middleware catalog — `@warlock.js/core/use-middleware/SKILL.md`; route attachment — `@warlock.js/core/register-route/SKILL.md`; response helpers — `@warlock.js/core/send-response/SKILL.md`; competing patterns: `express` `(req, res, next)` middleware, Fastify `preHandler` hooks.'
 ---
 
 # Warlock — write a middleware
@@ -8511,7 +8975,7 @@ Middleware is a plain function that runs before the controller. Two outcomes: re
 ```ts title="src/app/<module>/utils/<name>.middleware.ts"
 import type { Middleware } from "@warlock.js/core";
 
-export const requireApiKey: Middleware = (request, response) => {
+export const requireApiKey: Middleware = ({ request, response }) => {
   const key = request.header("X-API-Key");
 
   if (!key || key !== process.env.API_KEY) {
@@ -8522,16 +8986,14 @@ export const requireApiKey: Middleware = (request, response) => {
 };
 ```
 
-That's the contract: `(request: Request, response: Response) => Response | undefined | void`. Async is fine — return a `Promise<Response | undefined | void>`.
+That's the contract: `(context: HttpContext<Request>) => Response | undefined | void`, where `context` is `{ request, response }`. Async is fine — return a `Promise<Response | undefined | void>`.
 
 The real type, from `@warlock.js/core/src/router/types.ts`:
 
 ```ts
 export type Middleware<MiddlewareRequest extends Request = Request> = {
-  (request: MiddlewareRequest, response: Response): MiddlewareResponse;
+  (context: HttpContext<MiddlewareRequest>): MiddlewareResponse;
 };
-
-export type MiddlewareResponse = ReturnedResponse | undefined | void;
 ```
 
 ## Short-circuit vs continue
@@ -8541,7 +9003,7 @@ The pattern is "return a response to stop, return nothing to continue":
 ```ts
 import type { Middleware } from "@warlock.js/core";
 
-export const requireFeatureFlag: Middleware = async (request, response) => {
+export const requireFeatureFlag: Middleware = async ({ request, response }) => {
   const flag = await loadFeatureFlag(request.input("organization_id"));
 
   if (!flag.enabled) {
@@ -8559,8 +9021,8 @@ If you short-circuit, the controller never runs. The response helper you pick (`
 You can attach arbitrary fields to `request` from a middleware, and they survive into the controller. The cleanest pattern is to extend `Request` via module augmentation in a `.d.ts` and assign in the middleware:
 
 ```ts title="src/app/feature-flags/middleware/load-feature-flag.middleware.ts"
-import type { Middleware } from "@warlock.js/core";
-import type { FeatureFlag } from "../models/feature-flag";
+import type { Middleware, Request, RequestUser } from "@warlock.js/core";
+import { FeatureFlag } from "../models/feature-flag";
 
 declare module "@warlock.js/core" {
   interface Request {
@@ -8568,7 +9030,7 @@ declare module "@warlock.js/core" {
   }
 }
 
-export const loadFeatureFlag: Middleware = async (request) => {
+export const loadFeatureFlag: Middleware<Request & { user: RequestUser }> = async ({ request }) => {
   request.featureFlag = await FeatureFlag.findBy("organization_id", request.user.organizationId);
 };
 ```
@@ -8638,7 +9100,7 @@ export function guarded(callback: () => void) {
 }
 
 export function guardedAdmin(callback: () => void) {
-  router.group({ prefix: "/admin", middleware: [authMiddleware()] }, callback);
+  router.group({ prefix: "/admin", middleware: [authMiddleware("admin")] }, callback);
 }
 
 export function publicRoutes(callback: () => void) {
@@ -8656,7 +9118,7 @@ guarded(() => {
 });
 ```
 
-`authMiddleware(allowedUserType?)` accepts a user-type string or array. Without an arg it just verifies the token is present; with `"user"` / `"admin"` it also checks the decoded `userType` matches.
+`authMiddleware(allowedUserType, tokenFrom?)` requires a user-type string or array — `[]` accepts any authenticated user without checking `userType`; `"user"` / `"admin"` also checks the decoded `userType` matches.
 
 ## Common patterns
 
@@ -8683,13 +9145,13 @@ router.group(
 ```ts
 import type { Middleware } from "@warlock.js/core";
 
-export const optionalAuth: Middleware = async (request, response) => {
+export const optionalAuth: Middleware = async ({ request, response }) => {
   if (!request.authorizationValue) {
     return; // anonymous — let it through
   }
 
   // token present → enforce it
-  return authMiddleware("user")(request, response);
+  return authMiddleware("user")({ request, response });
 };
 ```
 
@@ -8705,7 +9167,7 @@ export const optionalAuth: Middleware = async (request, response) => {
 - **Group middleware runs before per-route middleware**, in array order. The full chain is `app.all → group → per-route → controller`. Mind the order if you stack auth + rate-limit + audit.
 - **Middleware can be async.** Returning `Promise<undefined>` continues the chain. Returning `Promise<Response>` short-circuits. The framework awaits the result.
 - **Don't mutate `request.payload` directly.** Use `request.setValidatedData(...)` or attach a new named field (`request.featureFlag = ...`). The internals expect `payload.all` shapes to come from the validator pipeline.
-- **`Middleware` is generic over the request type.** For middleware that assumes a validated schema, narrow it: `const m: Middleware<CreateProductRequest> = (request) => { ... }`. But most middlewares run before validation, so the default `Middleware` is right.
+- **`Middleware` is generic over the request type.** For middleware that assumes a validated schema, narrow it: `const m: Middleware<CreateProductRequest> = ({ request }) => { ... }`. But most middlewares run before validation, so the default `Middleware` is right.
 - **No `next()` parameter.** Express-style `next()` doesn't apply here. The framework chains based on return value.
 - **`request.baseRequest` / `response.baseResponse` are escape hatches, not API.** They expose the underlying Fastify primitives for cases the framework hasn't covered yet (streaming was the historical precedent). Prefer framework helpers first — `response.send()`, `response.header()`, `response.replay()`, `request.input()`, `request.detectIp()`, etc. If you find yourself reaching for `baseResponse` or `baseRequest` for non-streaming work, that's a missing helper — file an issue. The cache and idempotency middlewares both shipped with a quietly-broken FastifyReply-return bug because they bypassed the helper layer; the framework now guards `Response.send()` against double-send, but the right answer is "use the helper."
 - **Behind any proxy, use `request.detectIp()` not `request.ip`.** `request.ip` is the immediate peer (likely your load balancer); `request.detectIp()` honors `X-Real-IP` / `X-Forwarded-For`. Either way, only trust the result as far as you trust the upstream chain — those headers are client-settable; verify the request came through your trusted edge before treating the value as authoritative.
@@ -8759,12 +9221,12 @@ export default seeder({
 Run them:
 
 ```bash
-yarn warlock seed                            # discover + run all
-yarn warlock seed --list                     # show registry, don't run
-yarn warlock seed --path=src/app/roles/seeds/default-roles.seed.ts  # one file
-yarn warlock seed --fresh                    # truncate every table first, then run all
-yarn warlock seed --drop                     # undo every tracked record, reset the log
-yarn warlock seed --drop=default-roles       # undo just one seeder's records
+pnpm warlock seed                            # discover + run all
+pnpm warlock seed --list                     # show registry, don't run
+pnpm warlock seed --path=src/app/roles/seeds/default-roles.seed.ts  # one file
+pnpm warlock seed --fresh                    # truncate every table first, then run all
+pnpm warlock seed --drop                     # undo every tracked record, reset the log
+pnpm warlock seed --drop=default-roles       # undo just one seeder's records
 ```
 
 `--fresh` truncates **every** table in the DB (`datasource.driver.truncateTable(table, { cascade: true })`), including the `seeds` tracking table. After `--fresh`, `once: true` seeds will run again.
@@ -8902,8 +9364,8 @@ Every record you `track()` is written to a `seed_records` table (created on firs
 `warlock seed --drop` reads those refs and undoes the seed:
 
 ```bash
-yarn warlock seed --drop                # undo every tracked record across all seeders
-yarn warlock seed --drop=default-roles  # undo just one seeder's records
+pnpm warlock seed --drop                # undo every tracked record across all seeders
+pnpm warlock seed --drop=default-roles  # undo just one seeder's records
 ```
 
 What it does, inside a single transaction:
